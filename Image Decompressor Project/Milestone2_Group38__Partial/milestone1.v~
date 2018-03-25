@@ -1,0 +1,1301 @@
+/*
+Copyright by Henry Ko and Nicola Nicolici
+Developed for the Digital Systems Design course (COE3DQ4)
+Department of Electrical and Computer Engineering
+McMaster University
+Ontario, Canada
+*/
+
+`timescale 1ns/100ps
+`default_nettype none
+
+`include "define_state.h"
+
+// This is the top module
+// It connects the UART, SRAM and VGA together.
+// It gives access to the SRAM for UART and VGA
+
+module milestone1 (
+   input  logic            Clock,
+   input  logic            Resetn,
+
+   input  logic            start,
+   input  logic            finish,
+
+   output logic   [17:0]   SRAM_address,
+   output logic   [15:0]   SRAM_write_data,
+   output logic            SRAM_we_n,
+   output logic [15:0]	   SRAM_read_data
+);
+
+// SET PARAMETERS that define structure of the sram YUV locations to be read
+parameter 	Y_ADDRESS = 18'd0, //0 TO 38,399
+				U_ADDRESS = 18'd38400, // 38,400 TO 57,599
+				V_ADDRESS = 18'd57600, //57,600 TO 76,799
+				//UNUSED MEMORY SEGMENT --> 76,800  TO 146,943
+				RGB_ADDRESS = 18'd146944, // 146,944 TO 262,143
+
+				//constants for interpolation
+				FIR_const1 = 5'd21,
+				FIR_const2 = 5'd52,
+				FIR_const3 = 5'd159,
+
+				//constants for interpolation
+				CSC_const1 = 'd76284,
+				CSC_const2 = 'd25624,
+				CSC_const3 = 'd132251,
+				CSC_const4 = 'd104595,
+				CSC_const5 = 'd53281;
+
+// define data counters to traverse the entire SRAM ----> Y, U, V AND THEN RGB
+
+logic [15:0] Y_OFFSET_COUNTER;
+logic [14:0] U_OFFSET_COUNTER;
+logic [14:0] V_OFFSET_COUNTER;
+logic [14:0] RGB_OFFSET_COUNTER;
+
+logic [8:0] row_counter;
+logic [9:0] pixel_counter;
+logic softLeadOutFlag;
+
+// LET US IMPLEMENT M1_STATES----------
+
+//CHECK ALL LOGIC BITWIDTHS ---> ROUGH
+//define registers to hold YUV values red from SRAM
+
+//hold YUV vals
+logic [15:0] Y_even;
+logic [15:0] U_Even;
+logic [15:0] V_Even;
+
+logic [15:0] Y_odd;
+logic [15:0] U_odd;
+logic [15:0] V_odd;
+
+
+//define registers to be used in interpolation
+logic [63:0] U_Prime_Accum;
+logic [63:0] V_Prime_Accum;
+
+//define U operands for interpolation computations
+logic [15:0] U_0; //U[(j-5)/2]
+logic [15:0] U_1;
+logic [15:0] U_2;
+logic [15:0] U_3;
+logic [15:0] U_4;
+logic [15:0] U_5;
+
+logic [15:0] Uj2;
+
+//define V operands for interpolation computations
+logic [15:0] V_0;
+logic [15:0] V_1;
+logic [15:0] V_2;
+logic [15:0] V_3;
+logic [15:0] V_4;
+logic [15:0] V_5;
+
+logic [15:0] Vj2;
+
+//define end storage register that will store MAC accumulator results
+
+//accumulator units for upsampled data post CSC
+logic [63:0] RGB_MAC_EVEN_ACCUM;
+logic [63:0] RGB_MAC_ODD_ACCUM;
+
+//these store YUV' multiplied values for CSC()
+logic [63:0] RGB_MAC_Buf_Even_RED; // stores R even
+logic [63:0] RGB_MAC_Buf_Even_GREEN; // stores R odd
+logic [63:0] RGB_MAC_Buf_Even_BLUE; // stores R odd
+logic [63:0] RGB_MAC_Buf_Odd_RED; // stores G even
+logic [63:0] RGB_MAC_Buf_Odd_GREEN;	// stores G odd
+logic [63:0] RGB_MAC_Buf_Odd_BLUE; // stores R odd
+
+logic [7:0] Y_Buf_Even[1:0];
+logic [7:0] U_Buff_Even;
+logic [7:0] V_Buff_Even;
+
+logic [7:0] Y_Buff_Odd[1:0];
+logic [7:0] U_Buff_Odd;
+logic [7:0] V_Buff_Odd;
+
+assign resetn = ~SWITCH_I[17] && SRAM_ready;
+
+//figure out
+assign M1_result=M1_op1*M1_op2;
+assign M2_result=M2_op1*M2_op2;
+assign M3_result=M3_op1*M3_op2;
+assign M4_result=M4_op1*M4_op2;
+
+assign U_Prime_even_buf<= U_2;
+assign V_Prime_even_buf<= U_2;
+
+logic [63:0] Y_16_Buf_Even;
+logic [63:0] Y_16_Buf_Odd;
+
+
+always_ff @ (posedge CLOCK_50_I or negedge resetn) begin
+if (resetn == 1'b0) begin
+		M1_state <= S_IDLE;
+
+		SRAM_we_n <= 1'b1;
+		U_Prime_Accum <= 64'd0;
+		V_Prime_Accum <= 64'd0;
+		Y_OFFSET_COUNTER <= 16'd0;
+		U_OFFSET_COUNTER <= 15'd0;
+		V_OFFSET_COUNTER <= 15'd0;
+		row_counter <= 8'd0;
+		SRAM_write_data <= 16'd0;
+		SRAM_address <= 18'd0;
+		data_counter <= 18'd0;
+		Y_16_Buf_Even <= 64'd0;
+		Y_16_Buf_Odd <= 64'd0;
+
+
+	end else begin
+		case (M1_state)
+		S_IDLE: begin
+			if(row_counter != '0) //iterating thru rows that are not the first row
+				M1_state <= S_COMMON_CASE_0;
+			else begin //starting the new picture
+				M1_state <= S_LEAD_IN_STALL;
+			end
+		end
+//*********************************************************************************	
+//*********************************************************************************			
+//****--------------------LEAD-IN CASE BEGINS-----------------------------------****
+//*********************************************************************************	
+//*********************************************************************************	
+
+		S_LEAD_IN_STALL: begin //state -1
+			//Next State Addressing, Write Enable, Address Offset Counter Incrementing
+					SRAM_address <= Y_ADDRESS + Y_OFFSET_COUNTER; //stay in same sram address of Y location
+					Y_OFFSET_COUNTER <= Y_OFFSET_COUNTER + 16'd1;
+			//Current Memory Address Location Reading, Writing, Register Loading, Shifting & Resetting
+				//NONE
+			//MULTIPLICATION 1 -> PERFORM INTERPOLATION COMPUTATIONS
+				//NONE
+			//MULTIPLICATION 2 -> PERFORM CSC COMPUTATIONS
+				//NONE
+			M1_state <= S_LEAD_IN_0;
+			
+			
+
+		end
+		S_LEAD_IN_0: begin //column B of state table
+
+			//Next State Addressing, Write Enable, Address Offset Counter Incrementing
+				SRAM_address <= U_ADDRESS + U_OFFSET_COUNTER;
+				U_OFFSET_COUNTER <= U_OFFSET_COUNTER + 15'd1;
+			//Current Memory Address Location Reading, Writing, Register Loading, Shifting & Resetting //save sram values to registers. available 2 CC later
+				Y_even <= SRAM_read_data[15:8];  //Y0
+				Y_odd <= SRAM_read_data[7:0];    //Y1
+				Y_Buff_Even[1]<= SRAM_read_data[15:8];  //Y0 store in LSB of register
+				Y_Buff_Odd[1]<= SRAM_read_data[7:0];    //Y1 store in LSB of register
+			//MULTIPLICATION 1 -> PERFORM INTERPOLATION COMPUTATIONS
+				//NONE
+			//MULTIPLICATION 2 -> PERFORM CSC COMPUTATIONS
+				//NONE
+
+			M1_state <= S_LEAD_IN_1;
+
+		end
+		S_LEAD_IN_1: begin //column C
+			//Next State Addressing, Write Enable, Address Offset Counter Incrementing
+				SRAM_address <= V_ADDRESS + V_OFFSET_COUNTER;
+				V_OFFSET_COUNTER <= V_OFFSET_COUNTER + 15'd1;
+			//Current Memory Address Location Reading, Writing, Register Loading, Shifting & Resetting
+				//save sram values to registers
+				U_even <= SRAM_read_data[15:8];  //U_0
+				U_odd <= SRAM_read_data[7:0];    //U_1
+				U_Buff_Even<= SRAM_read_data[15:8];  //U_0 store in LSB of register
+				U_Buff_Odd<= SRAM_read_data[7:0];    //U_1 store in LSB of register
+
+			//set U registers with U[0] and U[1] because we are at those locations in sram
+				U_0<= SRAM_read_data[15:8];  //U0
+				U_1<= SRAM_read_data[15:8];	//U0
+				U_2<= SRAM_read_data[15:8]; 	//U0
+				U_3<= SRAM_read_data[7:0];  //U1
+			//MULTIPLICATION 1 -> PERFORM INTERPOLATION COMPUTATIONS
+				//NONE
+			//MULTIPLICATION 2 -> PERFORM CSC COMPUTATIONS
+				//NONE
+			M1_state <= S_LEAD_IN_2;
+
+		end
+		S_LEAD_IN_2: begin //column D
+			//Next State Addressing, Write Enable, Address Offset Counter Incrementing
+				SRAM_address <= U_ADDRESS + U_OFFSET_COUNTER;
+				U_OFFSET_COUNTER <= U_OFFSET_COUNTER + 15'd1;
+
+			//Current Memory Address Location Reading, Writing, Register Loading, Shifting & Resetting
+				V_0<= SRAM_read_data[15:8];//V0  //set V_1,V_2,V_3 ETC registers with V[0] and V[1] because we are at those locations in sram
+				V_1<= SRAM_read_data[15:8];//V0
+				V_2<= SRAM_read_data[15:8];//V0
+				V_3<= SRAM_read_data[7:0];//V1
+			//save sram values to registers
+				V_Even <= SRAM_read_data[15:8];//V0
+				V_odd <= SRAM_read_data[7:0]; //V1
+			//MULTIPLICATION 1 -> PERFORM INTERPOLATION COMPUTATIONS
+				///NONE
+			//MULTIPLICATION 2 -> PERFORM CSC COMPUTATIONS
+				//NONE
+
+				M1_state <= S_LEAD_IN_3;
+
+		end
+		S_LEAD_IN_3: begin //column E
+			//Next State Addressing, Write Enable, Address Offset Counter Incrementing
+				SRAM_address <= V_SEG + V_OFFSET_COUNTER;
+				V_OFFSET_COUNTER<= V_OFFSET_COUNTER + 'd1;
+			//Current Memory Address Location Reading, Writing, Register Loading, Shifting & Resetting
+				U_even<=SRAM_read_data[15:8]; //U2
+				U_odd<=SRAM_read_data[7:0]; //U3
+				
+				U_4<= SRAM_read_data[15:8];//U2
+				U_5<= SRAM_read_data[7:0];//U3
+			//MULTIPLICATION 1 -> PERFORM INTERPOLATION COMPUTATIONS
+				//note the U content will be available 2 CC later, so from column C
+				U_Prime_Accum <= U_Prime_Accum + M1_result - M2_result + M3_result + M4_result;  //COMPUTING U_PRIME 0_____21*U0 - 52*U0  + 159*U0  + 159*U1
+			//MULTIPLICATION 2 -> PERFORM CSC COMPUTATIONS
+				//NONE
+
+			M1_state <= S_LEAD_IN_4;
+
+		end
+		S_LEAD_IN_4: begin //column F
+			//Next State Addressing, Write Enable, Address Offset Counter Incrementing
+				//go to SRAM Y address to get ready to RD Y VALS
+				SRAM_address <= Y_SEG + Y_OFFSET_COUNTER;
+				Y_OFFSET_COUNTER<= Y_OFFSET_COUNTER + 'd1;
+
+			//Current Memory Address Location Reading, Writing, Register Loading, Shifting & Resetting
+				//save sram values to registers
+				V_even <= SRAM_read_data[15:8];
+				V_odd <= SRAM_read_data[7:0];
+
+				V_4<= SRAM_read_data[15:8];//V2
+				V_5<= SRAM_read_data[7:0];//V3
+			//MULTIPLICATION 1 -> PERFORM INTERPOLATION COMPUTATIONS
+				V_Prime_Accum <= V_Prime_Accum + M1_result + M2_result + M3_result + M4_result;//COMPUTING VPRIME 0 21*V0 - 52*V0  + 159*V0  + 159*V1
+			//MULTIPLICATION 2 -> PERFORM CSC COMPUTATIONS
+				//NONE
+			M1_state <= S_LEAD_IN_5;
+
+		end
+
+		S_LEAD_IN_5:begin //column G
+			//Next State Addressing, Write Enable, Address Offset Counter Incrementing
+				SRAM_address<=RGB_ADDRESS+RGB_OFFSET_COUNTER;
+				RGB_OFFSET_COUNTER<=RGB_OFFSET_COUNTER+1;
+			//Current Memory Address Location Reading, Writing, Register Loading, Shifting & Resetting
+
+				Y_even<=SRAM_read_data[15:8];//Y2
+				Y_odd<=SRAM_read_data[7:0];//Y3
+
+				Y_Buf_Even[0]<=Y_buf_Even[1]; //SHIFT BUFFER VALUES UP
+				Y_Buf_Odd[0]<=Y_buf_Odd[1];
+
+				Y_Buf_Even[1]<=SRAM_read_data[15:8];//Y2
+				Y_Buf_Odd[1]<=SRAM_read_data[7:0];//Y3
+
+
+			//MULTIPLICATION 1 -> PERFORM INTERPOLATION COMPUTATIONS
+					//000123
+				V_prime_odd_buf<=(V_Prime_Accum + M1_result + M2_result + '128) >> '8; //COMPUTED V PRIME 1
+				V_Prime_Accum<='0;
+			//MULTIPLICATION 2 -> PERFORM CSC COMPUTATIONS
+				RGB_MAC_EVEN_ACCUM <= RGB_MAC_EVEN_ACCUM + M3_result;
+				RGB_MAC_ODD_ACCUM <= RGB_MAC_ODD_ACCUM + M4_result;
+
+				M1_state <= S_LEAD_IN_6;
+		end
+		S_LEAD_IN_6: begin //column H
+			//Next State Addressing, Write Enable, Address Offset Counter Incrementing
+			//LOAD REGISTERS/ do writing USING CURRENT READ ADDRESS
+				U_0<= U_1  	//U0
+				U_1<= U_2	//U0
+				U_2<= U_3	//U1
+				U_3<= U_4  	//U2
+				U_4<= U_5	//U3
+				U_5<= U_even  	//U4
+
+				V_0<= V_1  	//V0
+				V_1<= V_2	//V0
+				V_2<= V_3	//V1
+				V_3<= V_4  	//V2
+				V_4<= V_5	//V3
+				V_5<= V_even  	//V4
+			//MULTIPLICATION 1 -> PERFORM INTERPOLATION COMPUTATIONS
+					//000123
+				U_prime_odd_buf <= (U_Prime_Accum - M1_result + M2_result + '128) >> '8; //COMPUTED U PRIME 0 --->-52 + 21, compute U'[1]
+				U_Prime_Accum<='0;
+			//MULTIPLICATION 2 -> PERFORM CSC COMPUTATIONS
+				//write R0GO to sram
+				RGB_MAC_Buf_Even_RED<=RGB_MAC_EVEN_ACCUM+M3_result; //R0 DONE
+				RGB_MAC_EVEN_ACCUM<='0;
+				RGB_MAC_Buf_Odd_RED<=RGB_MAC_ODD_ACCUM+M4_result; //R1 DONE
+				RGB_MAC_ODD_ACCUM<='0;
+
+			M1_state <= S_LEAD_IN_7;
+			//V'0 DONE
+			//U'0 DONE
+
+		end
+		S_LEAD_IN_7: begin// COLUMN I
+			//Next State Addressing, Write Enable, Address Offset Counter Incrementing
+				//NONE
+			//Current Memory Address Location Reading, Writing, Register Loading, Shifting & Resetting
+				//NONE
+
+			//MULTIPLICATION 1 -> PERFORM INTERPOLATION COMPUTATIONS
+			//MULTIPLICATION 2 -> PERFORM CSC COMPUTATIONS
+				RGB_MAC_EVEN_ACCUM <= RGB_MAC_EVEN_ACCUM + M1_result;
+				RGB_MAC_ODD_ACCUM <= RGB_MAC_ODD_ACCUM + M2_result;
+
+			M1_state <= S_LEAD_IN_8;
+
+		end
+		S_LEAD_IN_8: begin // COLUMN J
+			//Next State Addressing, Write Enable, Address Offset Counter Incrementing
+				SRAM_we_n=1'b0;
+			//Current Memory Address Location Reading, Writing, Register Loading, Shifting & Resetting
+      		//NONE
+			//MULTIPLICATION 1 -> PERFORM INTERPOLATION COMPUTATIONS
+				//NONE
+			//MULTIPLICATION 2 -> PERFORM CSC COMPUTATIONS
+				RGB_MAC_Buf_Even_GREEN <= RGB_MAC_EVEN_ACCUM + M1_result; //G0 DONE
+				RGB_MAC_EVEN_ACCUM<='0;
+				RGB_MAC_Buf_Odd_GREEN <= RGB_MAC_ODD_ACCUM + M2_result; //G1 DONE
+				RGB_MAC_ODD_ACCUM<='0;
+
+
+		end
+		S_LEAD_IN_9: begin //COLUMN K
+			//Next State Addressing, Write Enable, Address Offset Counter Incrementing
+				SRAM_address<=U_ADDRESS+U_OFFSET_COUNTER;
+				U_OFFSET_COUNTER<=U_OFFSET_COUNTER+1;
+			//Current Memory Address Location Reading, Writing, Register Loading, Shifting & Resetting
+				SRAM_write_data<={RGB_MAC_Buf_Even_RED, RGB_MAC_Buf_Even_GREEN};
+			//MULTIPLICATION 1 -> PERFORM INTERPOLATION COMPUTATIONS
+				//NONE
+			//MULTIPLICATION 2 -> PERFORM CSC COMPUTATIONS
+				RGB_MAC_Buf_Even_BLUE <= RGB_MAC_EVEN_ACCUM + M1_result; //B0 DONE
+				RGB_MAC_EVEN_ACCUM<='0;
+				RGB_MAC_Buf_Odd_BLUE <= RGB_MAC_ODD_ACCUM + M2_result;  //B1 DONE
+				RGB_MAC_ODD_ACCUM<='0;
+
+			M1_state <= S_LEAD_IN_10;
+			
+			end
+		//----- NOW WE HAVE TO FINISH INTERPOLATION FOR PIXEL 3 U,V PRIME
+		end
+		S_LEAD_IN_10: begin //column N
+			//Next State Addressing, Write Enable, Address Offset Counter Incrementing
+				SRAM_address <=V_ADDRESS+V_OFFSET_COUNTER;
+				V_OFFSET_COUNTER<=V_OFFSET_COUNTER+1;
+			//Current Memory Address Location Reading, Writing, Register Loading, Shifting & Resetting
+				U_even<=SRAM_read_data[15:8];
+				U_odd<=SRAM_read_data[7:0];
+
+				U_Buff_Even<=U_even; //store U2 AND U3 IN BUFFER
+				U_Buff_Odd<=U_odd;
+
+
+			//MULTIPLICATION 1 -> PERFORM INTERPOLATION COMPUTATIONS
+				//NONE
+			//MULTIPLICATION 2 -> PERFORM CSC COMPUTATIONS
+				//NONE
+			M1_state <= S_LEAD_IN_11;
+
+		end
+		S_LEAD_IN_11: begin //column O
+			//Next State Addressing, Write Enable, Address Offset Counter Incrementing
+				SRAM_address <=RGB_ADDRESS+RGB_OFFSET_COUNTER;
+				RGB_OFFSET_COUNTER<=RGB_OFFSET_COUNTER+1;
+				SRAM_we_n<=1'b0;
+				
+				U_Prime_Accum <='0;
+				V_Prime_Accum <='0;
+			//Current Memory Address Location Reading, Writing, Register Loading, Shifting & Resetting
+				V_even<=SRAM_read_data[15:8];
+				V_odd<=SRAM_read_data[7:0];
+
+				V_Buff_Even<=V_even; //store U2 AND U3 IN BUFFER
+				V_Buff_Odd<=V_odd;
+
+				V_0<=V_1 //u0
+				V_1<=V_2 //u0
+				V_2<=V_3
+				V_3<=V_4
+				V_4<=V_5 //U3
+				V_5<=SRAM_read_data[15:8] //u4
+			//MULTIPLICATION 1 -> PERFORM INTERPOLATION COMPUTATIONS
+			//MULTIPLICATION 2 -> PERFORM CSC COMPUTATIONS
+
+			M1_state <= S_LEAD_IN_12;
+
+		end
+		S_LEAD_IN_12: begin //column P
+			//Next State Addressing, Write Enable, Address Offset Counter Incrementing
+				//NONE
+			//Current Memory Address Location Reading, Writing, Register Loading, Shifting & Resetting
+				//NONE
+			//MULTIPLICATION 1 -> PERFORM INTERPOLATION COMPUTATIONS
+					//00123
+				U_Prime_Accum <= U_Prime_Accum + M1_result - M2_result + M3_result + M4_result; 
+
+			//MULTIPLICATION 2 -> PERFORM CSC COMPUTATIONS
+			M1_state <= S_LEAD_IN_13;
+
+		end
+		S_LEAD_IN_13: begin //column Q
+			//Next State Addressing, Write Enable, Address Offset Counter Incrementing
+				//none
+			//Current Memory Address Location Reading, Writing, Register Loading, Shifting & Resetting
+				//none
+			//MULTIPLICATION 1 -> PERFORM INTERPOLATION COMPUTATIONS
+					//00123
+          V_Prime_Accum <= V_Prime_Accum + M1_result + M2_result + M3_result + M4_result;
+
+			//MULTIPLICATION 2 -> PERFORM CSC COMPUTATIONS
+			M1_state <= S_LEAD_IN_14;
+
+		end
+		S_LEAD_IN_14: begin //column R---
+			//Next State Addressing, Write Enable, Address Offset Counter Incrementing
+				SRAM_address <= RGB_ADDRESS + RGB_OFFSET_COUNTER;
+				RGB_OFFSET_COUNTER <= RGB_OFFSET_COUNTER + '1;
+				SRAM_we_n <= 1'b0;
+			//Current Memory Address Location Reading, Writing, Register Loading, Shifting & Resetting
+				U_0<= U_1;  	//U0
+				U_1<= U_2;	//U1
+				U_2<= U_3;	//U2
+				U_3<= U_4;  	//U3
+				U_4<= U_5;	//U4
+				U_5<= U_odd;  	//U5
+
+				V_0<= V_1;	//V0
+				V_1<= V_2;	//V1
+				V_2<= V_3;	//V2
+				V_3<= V_4;  	//V3
+				V_4<= V_5;	//V4
+				V_5<= V_odd; 	//V5
+			//MULTIPLICATION 1 -> PERFORM INTERPOLATION COMPUTATIONS
+				U_prime_odd_buf <= (U_Prime_Accum - M1_result + M2_result + '128) >> '8; //UPrime 3
+				U_Prime_Accum<='0;
+
+				V_prime_odd_buf<=(V_Prime_Accum - M3_result + M4_result + '128) >> '8; //V PRIME 3
+				V_Prime_Accum<='0;
+
+			//MULTIPLICATION 2 -> PERFORM CSC COMPUTATIONS
+			M1_state <= S_LEAD_IN_17;
+
+		end
+
+//*********************************************************************************	
+//*********************************************************************************			
+//****--------------------COMMON CASE BEGINS-----------------------------------****
+//*********************************************************************************	
+//*********************************************************************************	
+
+
+		
+		S_COMMON_CASE_0: begin //column AE
+			//Next State Addressing, Write Enable, Address Offset Counter Incrementing
+				SRAM_address <= RGB_ADDRESS + RGB_OFFSET_COUNTER;
+				RGB_OFFSET_COUNTER <= RGB_OFFSET_COUNTER;
+			//Current Memory Address Location Reading, Writing, Register Loading, Shifting & Resetting
+				SRAM_write_data <= {RGB_MAC_Buf_Even_RED, RGB_MAC_Buf_Even_GREEN}; //STORE R0 G0
+			//MULTIPLICATION 1 -> PERFORM INTERPOLATION COMPUTATIONS
+				U_Prime_Accum <= M1_result; //U[-1]=U0
+				V_Prime_Accum <= M2_result; //V[-1]=U0
+			//MULTIPLICATION 2 -> PERFORM CSC COMPUTATIONS
+				//pre-load all registers with same value
+				RGB_MAC_EVEN_ACCUM <= M3_result; //76284*(y-16)' even	
+				RGB_MAC_ODD_ACCUM <= M4_result; //76284*y' odd
+				
+				Y_16_Buf_Even <= M3_result;
+				Y_16_Buf_Odd <= M4_result;
+				
+//				RGB_MAC_Buf_Even_RED<= M3_result; 
+//				RGB_MAC_Buf_Even_GREEN<= M3_result;
+//				RGB_MAC_Buf_Even_BLUE;
+//				RGB_MAC_Buf_Odd_RED;
+//				RGB_MAC_Buf_Odd_GREEN<=M4_result; 
+//				RGB_MAC_Buf_Odd_BLUE<=M4_result;
+			M1_state <= S_COMMON_CASE_1
+
+		end
+		S_COMMON_CASE_1: begin //column AF
+			//Next State Addressing, Write Enable, Address Offset Counter Incrementing
+				SRAM_address <= RGB_ADDRESS + RGB_OFFSET_COUNTER;
+				RGB_OFFSET_COUNTER <= RGB_OFFSET_COUNTER;
+			//Current Memory Address Location Reading, Writing, Register Loading, Shifting & Resetting
+				SRAM_write_data <= {RGB_MAC_Buf_Even_BLUE, RGB_MAC_Buf_Odd_RED}; //STORE B0 R1
+			//MULTIPLICATION 1 -> PERFORM INTERPOLATION COMPUTATIONS
+				U_Prime_Accum <= U_Prime_Accum - M1_result; //U1
+				V_Prime_Accum <= V_Prime_Accum - M2_result; //V1
+
+			//MULTIPLICATION 2 -> PERFORM CSC COMPUTATIONS
+				RGB_MAC_EVEN_ACCUM<= (RGB_MAC_EVEN_ACCUM + M3_result) >> 16;  //104595*v' even
+				RGB_MAC_ODD_ACCUM<= (RGB_MAC_ODD_ACCUM + M4_result) >> 16;  //104595*v' odd
+				
+				RGB_MAC_Buf_Even_RED<= (RGB_MAC_EVEN_ACCUM + M3_result) >> 16; //R2
+				RGB_MAC_Buf_Odd_RED<= (RGB_MAC_ODD_ACCUM + M4_result) >> 16;  //R3
+				
+			M1_state <= S_COMMON_CASE_2
+
+		end
+		S_COMMON_CASE_2: begin //column AG
+    //Next State Addressing, Write Enable, Address Offset Counter Incrementing
+				SRAM_address <= U_ADDRESS + U_OFFSET_COUNTER;
+				U_OFFSET_COUNTER <= U_OFFSET_COUNTER + 15'd1;
+    //Current Memory Address Location Reading, Writing, Register Loading, Shifting & Resetting
+				SRAM_write_data <= {RGB_MAC_Buf_Odd_BLUE, RGB_MAC_Buf_Odd_GREEN}; //STORE B1G1
+    //MULTIPLICATION 1 -> PERFORM INTERPOLATION COMPUTATIONS
+			U_Prime_Accum <= U_Prime_Accum + M1_result; //U2
+			V_Prime_Accum <= V_Prime_Accum + M2_result; //V2
+    //MULTIPLICATION 2 -> PERFORM CSC COMPUTATIONS
+				RGB_MAC_EVEN_ACCUM<= Y_16_Buf_Even - M3_result;  //76284*y'- 25624*U' even
+				RGB_MAC_ODD_ACCUM<= Y_16_Buf_Even - M4_result;  //76284*y'- 25624*U' odd
+			M1_state <= S_COMMON_CASE_3
+
+		end
+		S_COMMON_CASE_3: begin //column AH
+    //Next State Addressing, Write Enable, Address Offset Counter Incrementing
+				SRAM_address <= V_SEG + V_OFFSET_COUNTER;
+				V_OFFSET_COUNTER<= V_OFFSET_COUNTER + 'd1;
+    //Current Memory Address Location Reading, Writing, Register Loading, Shifting & Resetting
+				U_even<=SRAM_read_data[15:8]; //U4
+				U_odd<=SRAM_read_data[7:0]; //U5
+
+				U_Buff_Even<=U_even; //store U2 
+				U_Buff_Odd<=U_odd; //U3
+
+				U_0<=U_1 //u0
+				U_1<=U_2 //u0
+				U_2<=U_3 //U1
+				U_3<=U_4	//U2
+				U_4<=U_5 //U3
+				U_5<=SRAM_read_data[15:8] //u4
+    //MULTIPLICATION 1 -> PERFORM INTERPOLATION COMPUTATIONS
+			U_Prime_Accum <= U_Prime_Accum + M1_result; //U3
+			V_Prime_Accum <= V_Prime_Accum + M2_result; //V3
+ 
+    //MULTIPLICATION 2 -> PERFORM CSC COMPUTATIONS
+			RGB_MAC_EVEN_ACCUM<= (RGB_MAC_EVEN_ACCUM - M3_result) >> 16; //76284*y'- 25624*U' - 53281*V' even
+			RGB_MAC_ODD_ACCUM<= (RGB_MAC_ODD_ACCUM - M4_result) >> 16; //76284*y'- 25624*U' - 53281*V' odd
+			
+			RGB_MAC_Buf_Even_GREEN <= (RGB_MAC_EVEN_ACCUM - M3_result) >> 16; //G2
+			RGB_MAC_Buf_Odd_GREEN <= (RGB_MAC_ODD_ACCUM - M4_result) >> 16;  //G3
+		M1_state <= S_COMMON_CASE_4
+		
+		end
+		S_COMMON_CASE_4: begin //column AI
+    //Next State Addressing, Write Enable, Address Offset Counter Incrementing
+	 			SRAM_address <= RGB_ADDRESS + RGB_OFFSET_COUNTER;
+				RGB_OFFSET_COUNTER <= RGB_OFFSET_COUNTER;
+				
+				SRAM_we_n<=1'b0;
+
+    //Current Memory Address Location Reading, Writing, Register Loading, Shifting & Resetting
+	     V_even<=SRAM_read_data[15:8];
+        V_odd<=SRAM_read_data[7:0];
+
+        V_Buff_Even<=V_even; //store U2 AND U3 IN BUFFER
+        V_Buff_Odd<=V_odd;
+
+        V_0<=V_1 //u0
+        V_1<=V_2 //u0
+        V_2<=V_3 //U1
+        V_3<=V_4 //U2
+        V_4<=V_5 //U3
+        V_5<=SRAM_read_data[15:8] //u4
+    //MULTIPLICATION 1 -> PERFORM INTERPOLATION COMPUTATIONS
+			U_Prime_Accum <= U_Prime_Accum - M1_result; //U4
+			V_Prime_Accum <= V_Prime_Accum - M2_result; //V4
+
+    //MULTIPLICATION 2 -> PERFORM CSC COMPUTATIONS
+			RGB_MAC_Buf_Odd_BLUE<= Y_16_Buf_Even + M3_result;  //76284*y'-132251*U' even
+			RGB_MAC_Buf_Odd_BLUE<= Y_16_Buf_Even + M4_result;  //76284*y'- 132251*U' odd
+
+			M1_state <= S_COMMON_CASE_5
+
+		end
+		S_COMMON_CASE_5: begin //column AJ
+    //Next State Addressing, Write Enable, Address Offset Counter Incrementing
+	 			SRAM_address <= RGB_ADDRESS + RGB_OFFSET_COUNTER;
+				RGB_OFFSET_COUNTER <= RGB_OFFSET_COUNTER;
+				
+    //Current Memory Address Location Reading, Writing, Register Loading, Shifting & Resetting
+				SRAM_write_data<={RGB_MAC_Buf_Even_RED,RGB_MAC_Buf_Even_GREEN};//writing R2G2
+
+				U_0<= U_1;  	//U1
+				U_1<= U_2;	//U2
+				U_2<= U_3;	//U3
+				U_3<= U_4;  	//U4
+				U_4<= U_5;	//U5
+				U_5<= U_odd;  	//U6
+
+				V_0<= V_1;	//V1
+				V_1<= V_2;	//V2
+				V_2<= V_3;	//V3
+				V_3<= V_4;  	//V4
+				V_4<= V_5;	//V5
+				V_5<= V_odd; 	//V6
+    //MULTIPLICATION 1 -> PERFORM INTERPOLATION COMPUTATIONS
+		U_prime_odd_buf <= (U_Prime_Accum + M2_result + '128) >> '8; //-52 + 21, compute U'[1]
+      U_Prime_Accum<='0;
+
+      V_prime_odd_buf<=(V_Prime_Accum + M3_result + '128) >> '8;
+      V_Prime_Accum<='0;
+
+    //MULTIPLICATION 2 -> PERFORM CSC COMPUTATIONS
+		//NONE
+
+			M1_state <= S_COMMON_CASE_6
+
+		end
+		S_COMMON_CASE_6: begin //column AK
+    //Next State Addressing, Write Enable, Address Offset Counter Incrementing
+	 			SRAM_address <= RGB_ADDRESS + RGB_OFFSET_COUNTER;
+				RGB_OFFSET_COUNTER <= RGB_OFFSET_COUNTER;
+    //Current Memory Address Location Reading, Writing, Register Loading, Shifting & Resetting
+			SRAM_write_data<={RGB_MAC_Buf_Even_BLUE,RGB_MAC_Buf_Odd_RED};//writing B2R3
+    //MULTIPLICATION 1 -> PERFORM INTERPOLATION COMPUTATIONS
+
+    //MULTIPLICATION 2 -> PERFORM CSC COMPUTATIONS
+
+
+			M1_state <= S_COMMON_CASE_7
+
+		end
+		S_COMMON_CASE_7: begin //column AL
+    //Next State Addressing, Write Enable, Address Offset Counter Incrementing
+    //Current Memory Address Location Reading, Writing, Register Loading, Shifting & Resetting
+			SRAM_write_data<={RGB_MAC_Buf_Odd_GREEN,RGB_MAC_Buf_Odd_BLUE};//writing G3B3
+    //MULTIPLICATION 1 -> PERFORM INTERPOLATION COMPUTATIONS
+
+    //MULTIPLICATION 2 -> PERFORM CSC COMPUTATIONS
+
+			M1_state <= S_COMMON_CASE_8
+
+		end
+		S_COMMON_CASE_8: begin //column AM
+    //Next State Addressing, Write Enable, Address Offset Counter Incrementing
+ 
+    //Current Memory Address Location Reading, Writing, Register Loading, Shifting & Resetting
+    //WRITE R10G10
+    //MULTIPLICATION 1 -> PERFORM INTERPOLATION COMPUTATIONS
+
+    //MULTIPLICATION 2 -> PERFORM CSC COMPUTATIONS
+
+			M1_state <= S_COMMON_CASE_9
+
+		end
+		S_COMMON_CASE_9: begin //column AN
+    //Next State Addressing, Write Enable, Address Offset Counter Incrementing
+
+    //Current Memory Address Location Reading, Writing, Register Loading, Shifting & Resetting
+
+    //MULTIPLICATION 2 -> PERFORM CSC COMPUTATIONS
+
+
+			M1_state <= S_COMMON_CASE_10
+
+		end
+		S_COMMON_CASE_10: begin //column AO
+    //Next State Addressing, Write Enable, Address Offset Counter Incrementing
+
+    //Current Memory Address Location Reading, Writing, Register Loading, Shifting & Resetting
+    //MULTIPLICATION 1 -> PERFORM INTERPOLATION COMPUTATIONS
+
+    //MULTIPLICATION 2 -> PERFORM CSC COMPUTATIONS
+
+			M1_state <= S_COMMON_CASE_11
+
+		end
+		S_COMMON_CASE_11: begin //column AP
+    //Next State Addressing, Write Enable, Address Offset Counter Incrementing
+
+    //Current Memory Address Location Reading, Writing, Register Loading, Shifting & Resetting
+    //MULTIPLICATION 1 -> PERFORM INTERPOLATION COMPUTATIONS
+
+    //MULTIPLICATION 2 -> PERFORM CSC COMPUTATIONS
+
+			if(pixel_counter == 319) begin
+				M1_state <= S_HARD_LEAD_OUT0;
+			end else begin
+				M1_state <= S_COMMON_CASE_0;
+			end
+		end
+
+
+
+//*********************************************************************************	
+//*********************************************************************************			
+//****--------------------LEAD-OUT CASE BEGINS-----------------------------------****
+//*********************************************************************************	
+//*********************************************************************************	
+
+//ultimate finesse
+
+
+
+always_comb begin
+//perform multiplication here
+//https://www.altera.com/support/support-resources/design-examples/design-software/vhdl/vhd-signed-multiply-accumulator.html
+
+//lets make different multiplication cases for diff kinds of M1_states--->
+
+case(M1_STATE)
+M1_state <= S_IDLE;
+//		rect_row_count <= 3'd0;
+//		rect_col_count <= 3'd0;
+//		rect_width_count <= 6'd0;
+//		rect_height_count <= 5'd0;
+//
+//		VGA_red <= 10'd0;
+//		VGA_green <= 10'd0;
+//		VGA_blue <= 10'd0;
+
+SRAM_we_n <= 1'b1;
+SRAM_write_data <= 16'd0;
+SRAM_address <= 18'd0;
+/*	JUST BRINGING THIS LOWER TO SEE IT
+logic [7:0] Yeven;
+logic [7:0] U_Even;
+logic [7:0] V_Even;
+
+logic [7:0] Yodd;
+logic [7:0] U_odd;
+logic [7:0] Vodd;
+
+parameter 	Y_ADDRESS = 18'd0, //0 TO 38,399
+    U_ADDRESS = 18'd38400, // 38,400 TO 57,599
+    V_ADDRESS = 18'd57600, //57,600 TO 76,799
+    //UNUSED MEMORY SEGMENT --> 76,800  TO 146,943
+    RGB_ADDRESS = 18'd146944; // 146,944 TO 262,143
+
+*/
+
+data_counter <= 18'd0;
+
+end else begin
+case (M1_state)
+S_IDLE: begin
+
+end
+
+
+S_LEAD_IN_STALL: begin //state -1
+
+
+end
+
+S_LEAD_IN_0: begin //column B of state table
+
+
+end
+S_LEAD_IN_1: begin //column C
+
+
+end
+S_LEAD_IN_2: begin //column D
+
+end
+S_LEAD_IN_3: begin //column E
+
+	M1_op1=16'd21;
+	M1_op2=U_0;
+
+	M2_op1=16'52;
+	M2_op2=U_1;
+
+	M3_op1=16'159;
+	M3_op2=U_2;
+
+	M4_op1=16'159;
+	M4_op2=U_3;
+
+end
+S_LEAD_IN_4: begin //column F
+	M1_op1=16'd21;
+	M1_op2=V_0;
+
+	M2_op1=16'52;
+	M2_op2=V_1;
+
+	M3_op1=16'159;
+	M3_op2=V_2;
+
+	M4_op1=16'159;
+	M4_op2=V_3;
+end
+
+S_LEAD_IN_5:begin //column G
+	M1_op1=16'd52;
+	M1_op2=U_4;
+
+	M2_op1=16'd21;
+	M2_op2=U_5;
+
+	M1_op1=16'd52;
+	M1_op2=V_4;
+
+	M2_op1=16'21;
+	M2_op2=V_5;
+
+	M3_op1= 17'd76284;
+	M3_op2= Y_even;
+
+	M4_op1= 17'd76284;
+	M4_op2= Y_odd;
+
+
+
+end
+S_LEAD_IN_6: begin //column H
+	M1_op1=16'd52;
+	M1_op2=U_4;
+
+	M2_op1=16'd21;
+	M2_op2=U_5;
+
+	M3_op1='104595;
+	M3_op2=V_0; //V'0 == V0
+
+	M4_op1='104595;
+	M4_op2=V_prime_odd_buf; //V'1
+
+end
+S_LEAD_IN_7: begin// COLUMN I
+	M1_op1='25624;
+	M1_op2=U_0;
+
+	M2_op1='25624;
+	M2_op2=U_prime_odd_buf;
+
+end
+S_LEAD_IN_8: begin // COLUMN J
+	M1_op1='53281;
+	M1_op2=V_0;
+
+	M2_op1='53281;
+	M2_op2=V_Prime_Odd_buf;
+
+end
+S_LEAD_IN_9: begin //COLUMN K
+	M1_op1=16'd132251;
+	M1_op2=U_0;
+
+	M2_op1=16'132251;
+	M2_op2=U_Prime_Odd_buf;
+end
+S_LEAD_IN_10: begin  //COLUMN L
+
+end
+S_LEAD_IN_11: begin //column M
+
+
+end
+S_LEAD_IN_12: begin //column N
+
+
+end
+S_LEAD_IN_13: begin //column O
+
+
+end
+S_LEAD_IN_14: begin //column P
+  //INTERPOLATION
+  M1_op1=16'd21;
+  M1_op2=U_0;
+
+  M2_op1=16'52;
+  M2_op2=U_1;
+
+  M3_op1=16'159;
+  M3_op2=U_2;
+
+  M4_op1=16'159;
+  M4_op2=U_3;
+
+end
+S_LEAD_IN_15: begin //column Q
+  //INTERPOLATION
+  M1_op1=16'd21;
+  M1_op2=V_0;
+
+  M2_op1=16'52;
+  M2_op2=V_1;
+
+  M3_op1=16'159;
+  M3_op2=V_2;
+
+  M4_op1=16'159;
+  M4_op2=V_3;
+
+end
+S_LEAD_IN_16: begin //column R
+//FINISH INTERPOLATION
+  M1_op1=16'd52;
+  M1_op2=U_4;
+
+  M2_op1=16'd21;
+  M2_op2=U_5;
+
+  M3_op1=16'd52;
+  M3_op2=U_4;
+
+  M4_op1=16'd21;
+  M4_op2=U_5;
+
+
+end
+S_LEAD_IN_17: begin //column S
+  M1_op1= 17'd76284;
+  M1_op2= Y_even;
+
+  M2_op1= 17'd76284;
+  M2_op2= Y_odd;
+
+  M3_op1='104595;
+  M3_op2=V_prime_even_buf;
+
+  M4_op1='104595;
+  M4_op2=V_prime_odd_buf;
+
+end
+S_LEAD_IN_18: begin //column T
+    M1_op1='25624;
+    M1_op2=U_2;// U[1]
+
+    M2_op1='25624;
+    M2_op2=U_prime_odd_buf;
+
+    M3_op1='53281;
+    M3_op2=V_2; //V[2]
+
+    M4_op1='53281;
+    M4_op2=V_Prime_Odd_buf;
+
+end
+S_LEAD_IN_19: begin //column U
+  M1_op1=16'd13251;
+  M1_op2=U_2;
+
+  M2_op1=16'd13251;
+  M2_op2=U_prime_odd_buf;
+
+S_LEAD_IN_20: begin //column V
+
+
+end
+S_LEAD_IN_21: begin //column W
+M1_op1=16'd21;
+M1_op2=U_0;
+
+M2_op1=16'52;
+M2_op2=U_1;
+
+M3_op1=16'159;
+M3_op2=U_2;
+
+M4_op1=16'159;
+M4_op2=U_3;
+
+end
+S_LEAD_IN_22: begin //column X
+M1_op1=16'd21;
+M1_op2=U_0;
+
+M2_op1=16'52;
+M2_op2=U_1;
+
+M3_op1=16'159;
+M3_op2=U_2;
+
+M4_op1=16'159;
+M4_op2=U_3;
+
+end
+S_LEAD_IN_23: begin //column Y
+M1_op1=16'd21;
+M1_op2=U_0;
+
+M2_op1=16'52;
+M2_op2=U_1;
+
+M3_op1=16'159;
+M3_op2=U_2;
+
+M4_op1=16'159;
+M4_op2=U_3;
+
+end
+S_LEAD_IN_24: begin //column Z
+M1_op1=16'd21;
+M1_op2=U_0;
+
+M2_op1=16'52;
+M2_op2=U_1;
+
+M3_op1=16'159;
+M3_op2=U_2;
+
+M4_op1=16'159;
+M4_op2=U_3;
+
+end
+S_LEAD_IN_25: begin //column AA
+M1_op1=16'd21;
+M1_op2=U_0;
+
+M2_op1=16'52;
+M2_op2=U_1;
+
+M3_op1=16'159;
+M3_op2=U_2;
+
+M4_op1=16'159;
+M4_op2=U_3;
+
+end
+S_LEAD_IN_26: begin //column AB
+M1_op1=16'd21;
+M1_op2=U_0;
+
+M2_op1=16'52;
+M2_op2=U_1;
+
+M3_op1=16'159;
+M3_op2=U_2;
+
+M4_op1=16'159;
+M4_op2=U_3;
+
+end
+S_LEAD_IN_27: begin //column AC
+M1_op1=16'd21;
+M1_op2=U_0;
+
+M2_op1=16'52;
+M2_op2=U_1;
+
+M3_op1=16'159;
+M3_op2=U_2;
+
+M4_op1=16'159;
+M4_op2=U_3;
+
+
+end
+S_LEAD_IN_28: begin //column AD
+M1_op1=16'd21;
+M1_op2=U_0;
+
+M2_op1=16'52;
+M2_op2=U_1;
+
+M3_op1=16'159;
+M3_op2=U_2;
+
+M4_op1=16'159;
+M4_op2=U_3;
+
+end
+S_COMMON_CASE_0: begin //column AE
+M1_op1=16'd21;
+M1_op2=U_0;
+
+M2_op1=16'52;
+M2_op2=U_1;
+
+M3_op1=16'159;
+M3_op2=U_2;
+
+M4_op1=16'159;
+M4_op2=U_3;
+
+end
+S_COMMON_CASE_1: begin //column AE
+M1_op1=16'd21;
+M1_op2=U_0;
+
+M2_op1=16'52;
+M2_op2=U_1;
+
+M3_op1=16'159;
+M3_op2=U_2;
+
+M4_op1=16'159;
+M4_op2=U_3;
+
+end
+S_COMMON_CASE_2: begin //column AE
+M1_op1=16'd21;
+M1_op2=U_0;
+
+M2_op1=16'52;
+M2_op2=U_1;
+
+M3_op1=16'159;
+M3_op2=U_2;
+
+M4_op1=16'159;
+M4_op2=U_3;
+
+end
+S_COMMON_CASE_3: begin //column AE
+M1_op1=16'd21;
+M1_op2=U_0;
+
+M2_op1=16'52;
+M2_op2=U_1;
+
+M3_op1=16'159;
+M3_op2=U_2;
+
+M4_op1=16'159;
+M4_op2=U_3;
+
+end
+S_COMMON_CASE_4: begin //column AE
+M1_op1=16'd21;
+M1_op2=U_0;
+
+M2_op1=16'52;
+M2_op2=U_1;
+
+M3_op1=16'159;
+M3_op2=U_2;
+
+M4_op1=16'159;
+M4_op2=U_3;
+
+end
+S_COMMON_CASE_5: begin //column AE
+M1_op1=16'd21;
+M1_op2=U_0;
+
+M2_op1=16'52;
+M2_op2=U_1;
+
+M3_op1=16'159;
+M3_op2=U_2;
+
+M4_op1=16'159;
+M4_op2=U_3;
+
+end
+S_COMMON_CASE_6: begin //column AE
+M1_op1=16'd21;
+M1_op2=U_0;
+
+M2_op1=16'52;
+M2_op2=U_1;
+
+M3_op1=16'159;
+M3_op2=U_2;
+
+M4_op1=16'159;
+M4_op2=U_3;
+
+end
+S_COMMON_CASE_7: begin //column AE
+M1_op1=16'd21;
+M1_op2=U_0;
+
+M2_op1=16'52;
+M2_op2=U_1;
+
+M3_op1=16'159;
+M3_op2=U_2;
+
+M4_op1=16'159;
+M4_op2=U_3;
+
+end
+S_COMMON_CASE_8: begin //column AE
+M1_op1=16'd21;
+M1_op2=U_0;
+
+M2_op1=16'52;
+M2_op2=U_1;
+
+M3_op1=16'159;
+M3_op2=U_2;
+
+M4_op1=16'159;
+M4_op2=U_3;
+
+end
+S_COMMON_CASE_9: begin //column AE
+M1_op1=16'd21;
+M1_op2=U_0;
+
+M2_op1=16'52;
+M2_op2=U_1;
+
+M3_op1=16'159;
+M3_op2=U_2;
+
+M4_op1=16'159;
+M4_op2=U_3;
+
+end
+S_COMMON_CASE_10: begin //column AE
+M1_op1=16'd21;
+M1_op2=U_0;
+
+M2_op1=16'52;
+M2_op2=U_1;
+
+M3_op1=16'159;
+M3_op2=U_2;
+
+M4_op1=16'159;
+M4_op2=U_3;
+
+end
+S_COMMON_CASE_11: begin //column AE
+M1_op1=16'd21;
+M1_op2=U_0;
+
+M2_op1=16'52;
+M2_op2=U_1;
+
+M3_op1=16'159;
+M3_op2=U_2;
+
+M4_op1=16'159;
+M4_op2=U_3;
+
+end
+S_COMMON_CASE_12: begin //column AE
+M1_op1=16'd21;
+M1_op2=U_0;
+
+M2_op1=16'52;
+M2_op2=U_1;
+
+M3_op1=16'159;
+M3_op2=U_2;
+
+M4_op1=16'159;
+M4_op2=U_3;
+
+end
+S_HARD_LEAD_OUT:begin
+
+end
+
+
+
+
+
+end
+
+endmodule
